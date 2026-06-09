@@ -720,7 +720,7 @@ func TestLoginSubmit_SetsCookieDomainWithBaseDomain(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	// Set a valid CSRF cookie (value must match form token).
 	req.AddCookie(&http.Cookie{
-		Name:  "csrf_" + base64.URLEncoding.EncodeToString([]byte(cfg.BaseDomain)),
+		Name:  "csrf_example_com",
 		Value: "test_csrf_token_value",
 	})
 	rr := httptest.NewRecorder()
@@ -968,7 +968,19 @@ func TestLogout_POST(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /login: %v", err)
 	}
+
+	// Extract session cookie from login response.
+	var sessionCookie string
+	for _, c := range resp.Cookies() {
+		if c.Name == "test_session" && c.Value != "" {
+			sessionCookie = c.Value
+			break
+		}
+	}
 	resp.Body.Close()
+	if sessionCookie == "" {
+		t.Fatal("no session cookie after login")
+	}
 
 	// Get a fresh CSRF token for logout.
 	logoutPage, err := client.Get(ts.URL + "/login")
@@ -989,7 +1001,7 @@ func TestLogout_POST(t *testing.T) {
 
 	logoutReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/logout", strings.NewReader(url.Values{"csrf_token": {logoutCSRF}}.Encode()))
 	logoutReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	logoutReq.AddCookie(cookie)
+	logoutReq.AddCookie(&http.Cookie{Name: "test_session", Value: sessionCookie})
 	logoutResp, err := client.Do(logoutReq)
 	if err != nil {
 		t.Fatalf("POST /logout: %v", err)
@@ -1001,7 +1013,7 @@ func TestLogout_POST(t *testing.T) {
 
 	// Session should now be invalid.
 	authReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/auth", nil)
-	authReq.AddCookie(cookie)
+	authReq.AddCookie(&http.Cookie{Name: "test_session", Value: sessionCookie})
 	authResp, err := client.Do(authReq)
 	if err != nil {
 		t.Fatalf("GET /auth after POST /logout: %v", err)

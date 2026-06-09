@@ -68,20 +68,43 @@ func newTestServer(t *testing.T) (*httptest.Server, *auth.Credentials) {
 	return ts, creds
 }
 
-// login performs a POST /login and returns the session cookie, or fails the test.
+// login performs a POST /login (with CSRF token) and returns the session cookie, or fails the test.
 func login(t *testing.T, ts *httptest.Server) *http.Cookie {
 	t.Helper()
 
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar.New: %v", err)
+	}
 	client := &http.Client{
+		Jar: jar,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse // don't follow redirects
 		},
 	}
 
+	// Get CSRF token first.
+	loginResp, err := client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	var csrfToken string
+	for _, c := range loginResp.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			csrfToken = c.Value
+			break
+		}
+	}
+	loginResp.Body.Close()
+	if csrfToken == "" {
+		t.Fatal("no CSRF token on login page")
+	}
+
 	form := url.Values{
-		"username": {testUser},
-		"password": {testPassword},
-		"rd":       {"/"},
+		"username":   {testUser},
+		"password":   {testPassword},
+		"rd":         {"/"},
+		"csrf_token": {csrfToken},
 	}
 	resp, err := client.PostForm(ts.URL+"/login", form)
 	if err != nil {
@@ -599,14 +622,38 @@ func TestLoginPage_GET_WithRd(t *testing.T) {
 
 func TestLoginSubmit_ValidCredentials(t *testing.T) {
 	ts, _ := newTestServer(t)
-	client := noFollowClient()
+
+	// Get CSRF token first.
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	var csrfToken string
+	for _, c := range resp.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			csrfToken = c.Value
+			break
+		}
+	}
+	resp.Body.Close()
+	if csrfToken == "" {
+		t.Fatal("no CSRF token")
+	}
 
 	form := url.Values{
-		"username": {testUser},
-		"password": {testPassword},
-		"rd":       {"/"},
+		"username":   {testUser},
+		"password":   {testPassword},
+		"rd":         {"/"},
+		"csrf_token": {csrfToken},
 	}
-	resp, err := client.PostForm(ts.URL+"/login", form)
+	resp, err = client.PostForm(ts.URL+"/login", form)
 	if err != nil {
 		t.Fatalf("POST /login: %v", err)
 	}
@@ -664,12 +711,18 @@ func TestLoginSubmit_SetsCookieDomainWithBaseDomain(t *testing.T) {
 	}
 
 	form := url.Values{
-		"username": {testUser},
-		"password": {testPassword},
-		"rd":       {"https://asdf.example.com/"},
+		"username":   {testUser},
+		"password":   {testPassword},
+		"rd":         {"https://asdf.example.com/"},
+		"csrf_token": {"test_csrf_token_value"},
 	}
 	req := httptest.NewRequest(http.MethodPost, "/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Set a valid CSRF cookie (value must match form token).
+	req.AddCookie(&http.Cookie{
+		Name:  "csrf_" + base64.URLEncoding.EncodeToString([]byte(cfg.BaseDomain)),
+		Value: "test_csrf_token_value",
+	})
 	rr := httptest.NewRecorder()
 
 	h.LoginSubmit(rr, req)
@@ -697,14 +750,38 @@ func TestLoginSubmit_SetsCookieDomainWithBaseDomain(t *testing.T) {
 
 func TestLoginSubmit_InvalidPassword(t *testing.T) {
 	ts, _ := newTestServer(t)
-	client := noFollowClient()
+
+	// Get CSRF token first.
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	var csrfToken string
+	for _, c := range resp.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			csrfToken = c.Value
+			break
+		}
+	}
+	resp.Body.Close()
+	if csrfToken == "" {
+		t.Fatal("no CSRF token")
+	}
 
 	form := url.Values{
-		"username": {testUser},
-		"password": {"wrongpassword"},
-		"rd":       {"/"},
+		"username":   {testUser},
+		"password":   {"wrongpassword"},
+		"rd":         {"/"},
+		"csrf_token": {csrfToken},
 	}
-	resp, err := client.PostForm(ts.URL+"/login", form)
+	resp, err = client.PostForm(ts.URL+"/login", form)
 	if err != nil {
 		t.Fatalf("POST /login: %v", err)
 	}
@@ -717,14 +794,38 @@ func TestLoginSubmit_InvalidPassword(t *testing.T) {
 
 func TestLoginSubmit_UnknownUser(t *testing.T) {
 	ts, _ := newTestServer(t)
-	client := noFollowClient()
+
+	// Get CSRF token first.
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	var csrfToken string
+	for _, c := range resp.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			csrfToken = c.Value
+			break
+		}
+	}
+	resp.Body.Close()
+	if csrfToken == "" {
+		t.Fatal("no CSRF token")
+	}
 
 	form := url.Values{
-		"username": {"nobody"},
-		"password": {testPassword},
-		"rd":       {"/"},
+		"username":   {"nobody"},
+		"password":   {testPassword},
+		"rd":         {"/"},
+		"csrf_token": {csrfToken},
 	}
-	resp, err := client.PostForm(ts.URL+"/login", form)
+	resp, err = client.PostForm(ts.URL+"/login", form)
 	if err != nil {
 		t.Fatalf("POST /login: %v", err)
 	}
@@ -737,14 +838,38 @@ func TestLoginSubmit_UnknownUser(t *testing.T) {
 
 func TestLoginSubmit_RedirectsToRd(t *testing.T) {
 	ts, _ := newTestServer(t)
-	client := noFollowClient()
+
+	// Get CSRF token first.
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	var csrfToken string
+	for _, c := range resp.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			csrfToken = c.Value
+			break
+		}
+	}
+	resp.Body.Close()
+	if csrfToken == "" {
+		t.Fatal("no CSRF token")
+	}
 
 	form := url.Values{
-		"username": {testUser},
-		"password": {testPassword},
-		"rd":       {"/dashboard"},
+		"username":   {testUser},
+		"password":   {testPassword},
+		"rd":         {"/dashboard"},
+		"csrf_token": {csrfToken},
 	}
-	resp, err := client.PostForm(ts.URL+"/login", form)
+	resp, err = client.PostForm(ts.URL+"/login", form)
 	if err != nil {
 		t.Fatalf("POST /login: %v", err)
 	}
@@ -807,11 +932,63 @@ func TestLogout_GET(t *testing.T) {
 
 func TestLogout_POST(t *testing.T) {
 	ts, _ := newTestServer(t)
-	client := noFollowClient()
 
-	cookie := login(t, ts)
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 
-	logoutReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/logout", nil)
+	// Login with CSRF token to get session cookie.
+	loginResp, err := client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	var csrfToken string
+	for _, c := range loginResp.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			csrfToken = c.Value
+			break
+		}
+	}
+	loginResp.Body.Close()
+	if csrfToken == "" {
+		t.Fatal("no CSRF token")
+	}
+
+	loginForm := url.Values{
+		"username":   {testUser},
+		"password":   {testPassword},
+		"rd":         {"/"},
+		"csrf_token": {csrfToken},
+	}
+	resp, err := client.PostForm(ts.URL+"/login", loginForm)
+	if err != nil {
+		t.Fatalf("POST /login: %v", err)
+	}
+	resp.Body.Close()
+
+	// Get a fresh CSRF token for logout.
+	logoutPage, err := client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	var logoutCSRF string
+	for _, c := range logoutPage.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			logoutCSRF = c.Value
+			break
+		}
+	}
+	logoutPage.Body.Close()
+	if logoutCSRF == "" {
+		t.Fatal("no CSRF token on login page")
+	}
+
+	logoutReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/logout", strings.NewReader(url.Values{"csrf_token": {logoutCSRF}}.Encode()))
+	logoutReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	logoutReq.AddCookie(cookie)
 	logoutResp, err := client.Do(logoutReq)
 	if err != nil {
@@ -1581,13 +1758,17 @@ func TestLoginPage_RedirectValidation(t *testing.T) {
 			resp := rr.Result()
 			defer resp.Body.Close()
 
-			// Check the hidden rd field in the response body.
+			// Check the hidden csrf_token field exists and has a non-empty value.
 			body, _ := io.ReadAll(resp.Body)
 			bodyStr := string(body)
 
 			if tc.wantRedirect {
-				if !strings.Contains(bodyStr, "csrf_") {
-					t.Errorf("expected CSRF token in response")
+				if !strings.Contains(bodyStr, `name="csrf_token"`) {
+					t.Errorf("expected hidden csrf_token field in response")
+				}
+				// Check that the value is non-empty (at least 43 chars for 32 bytes base64).
+				if !strings.Contains(bodyStr, `value="`) || strings.Count(bodyStr, `value=""`) > 0 {
+					t.Errorf("expected non-empty csrf_token value in response")
 				}
 			}
 		})
@@ -1760,24 +1941,11 @@ func TestLogoutWithCSRF(t *testing.T) {
 		},
 	}
 
-	// Login to get session cookie.
-	form := url.Values{
-		"username": {testUser},
-		"password": {testPassword},
-		"rd":       {"/"},
-	}
-	resp, err := client.PostForm(ts.URL+"/login", form)
-	if err != nil {
-		t.Fatalf("POST /login: %v", err)
-	}
-	resp.Body.Close()
-
-	// Get login page for CSRF token (the session cookie should still be there).
-	resp, err = client.Get(ts.URL + "/login")
+	// Get login page to obtain a CSRF token (needed for POST /login).
+	resp, err := client.Get(ts.URL + "/login")
 	if err != nil {
 		t.Fatalf("GET /login: %v", err)
 	}
-	defer resp.Body.Close()
 
 	var csrfToken string
 	for _, c := range resp.Cookies() {
@@ -1786,12 +1954,44 @@ func TestLogoutWithCSRF(t *testing.T) {
 			break
 		}
 	}
+	resp.Body.Close()
 	if csrfToken == "" {
 		t.Fatal("no CSRF token on login page")
 	}
 
+	// Login with CSRF token.
+	loginForm := url.Values{
+		"username":   {testUser},
+		"password":   {testPassword},
+		"rd":         {"/"},
+		"csrf_token": {csrfToken},
+	}
+	resp, err = client.PostForm(ts.URL+"/login", loginForm)
+	if err != nil {
+		t.Fatalf("POST /login with CSRF: %v", err)
+	}
+	resp.Body.Close()
+
+	// Get a fresh CSRF token for logout.
+	resp, err = client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login after login: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var logoutCSRF string
+	for _, c := range resp.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			logoutCSRF = c.Value
+			break
+		}
+	}
+	if logoutCSRF == "" {
+		t.Fatal("no CSRF token on login page")
+	}
+
 	// POST /logout with valid CSRF.
-	form2 := url.Values{"csrf_token": {csrfToken}}
+	form2 := url.Values{"csrf_token": {logoutCSRF}}
 	resp, err = client.PostForm(ts.URL+"/logout", form2)
 	if err != nil {
 		t.Fatalf("POST /logout with valid CSRF: %v", err)

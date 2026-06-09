@@ -185,13 +185,19 @@ func (h *Handlers) LoginPage(w http.ResponseWriter, r *http.Request) {
 		rd = "/"
 	}
 
-	// Validate redirect URL: allow relative URLs and same-domain / subdomain URLs.
+	// Validate redirect URL: allow relative paths and same-domain / subdomain URLs.
 	if !isValidRedirect(rd, h.cfg.BaseDomain, r.Host) {
 		rd = "/"
 	}
 
 	// Generate CSRF token and store it in a dedicated cookie.
 	csrfToken := generateCSRFToken()
+	if csrfToken == "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("internal server error"))
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     csrfCookieName(h.cfg.BaseDomain),
 		Value:    csrfToken,
@@ -235,18 +241,35 @@ func (h *Handlers) LoginSubmit(w http.ResponseWriter, r *http.Request) {
 		rd = "/"
 	}
 
-	// Validate CSRF token.
-	csrfCookie, err := r.Cookie(csrfCookieName(h.cfg.BaseDomain))
+	// Validate CSRF token — must be present and matching.
+	csrfCookie, csrfErr := r.Cookie(csrfCookieName(h.cfg.BaseDomain))
 	csrfForm := r.FormValue("csrf_token")
-	if err == nil && csrfCookie.Value != "" && csrfForm != "" {
-		if !constantTimeEqual([]byte(csrfCookie.Value), []byte(csrfForm)) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusForbidden)
-			if err := h.loginTmpl.Execute(w, loginData{Error: "Invalid or expired CSRF token.", RedirectURL: rd}); err != nil {
-				log.Printf("template error: %v", err)
-			}
-			return
+	if csrfErr != nil || csrfCookie.Value == "" || csrfForm == "" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'self'")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusForbidden)
+		if err := h.loginTmpl.Execute(w, loginData{Error: "CSRF token missing or invalid.", RedirectURL: rd}); err != nil {
+			log.Printf("template error: %v", err)
 		}
+		return
+	}
+	if !constantTimeEqual([]byte(csrfCookie.Value), []byte(csrfForm)) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'self'")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.WriteHeader(http.StatusForbidden)
+		if err := h.loginTmpl.Execute(w, loginData{Error: "Invalid or expired CSRF token.", RedirectURL: rd}); err != nil {
+			log.Printf("template error: %v", err)
+		}
+		return
+	}
+
+	// Validate redirect URL before using it.
+	if !isValidRedirect(rd, h.cfg.BaseDomain, r.Host) {
+		rd = "/"
 	}
 
 	if !h.creds.Verify(username, password) {
@@ -296,26 +319,31 @@ func (h *Handlers) Logout(w http.ResponseWriter, r *http.Request) {
 }
 
 // LogoutWithCSRF validates the CSRF token before clearing the session.
+// Requires successful form parse and matching cookie+form tokens; returns 400 otherwise.
 func (h *Handlers) LogoutWithCSRF(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err == nil {
-		csrfCookie, cookieErr := r.Cookie(csrfCookieName(h.cfg.BaseDomain))
-		csrfForm := r.FormValue("csrf_token")
-		if cookieErr == nil && csrfCookie.Value != "" && csrfForm != "" {
-			if !constantTimeEqual([]byte(csrfCookie.Value), []byte(csrfForm)) {
-				http.Error(w, "bad request", http.StatusBadRequest)
-				return
-			}
-		}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	csrfCookie, cookieErr := r.Cookie(csrfCookieName(h.cfg.BaseDomain))
+	csrfForm := r.FormValue("csrf_token")
+	if cookieErr != nil || csrfCookie.Value == "" || csrfForm == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !constantTimeEqual([]byte(csrfCookie.Value), []byte(csrfForm)) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
 	}
 	h.Logout(w, r)
 }
 
 // isValidRedirect reports whether rd is a safe redirect target.
 // It allows:
-//   - Relative URLs (starting with / or ./)
-//   - Same-host URLs
-//   - Subdomain URLs of the configured BaseDomain (matching cookie scope)
-// It rejects protocol-relative URLs (//evil.com) and cross-origin absolute URLs.
+//   - Relative paths (/path, ./relative, ../parent)
+//   - Absolute http(s) URLs to same-host or subdomains of BaseDomain
+// It rejects protocol-relative URLs (//evil.com), non-http(s) schemes,
+// and cross-origin absolute URLs.
 func isValidRedirect(rd, baseDomain, requestHost string) bool {
 	if rd == "" {
 		return false
@@ -324,21 +352,35 @@ func isValidRedirect(rd, baseDomain, requestHost string) bool {
 	if strings.HasPrefix(rd, "//") {
 		return false
 	}
-	// Allow relative URLs (path-only or ../).
-	if !strings.Contains(rd, "://") {
+	// Allow relative paths (/, ./, ../).
+	switch {
+	case rd == "/", rd == ".", rd == "..":
+		return true
+	case strings.HasPrefix(rd, "/"),
+		strings.HasPrefix(rd, "./"),
+		strings.HasPrefix(rd, "../"):
 		return true
 	}
-	// Parse as absolute URL and validate the host.
+	// Parse as absolute URL and validate the scheme/host.
 	parsed, err := url.Parse(rd)
 	if err != nil {
+		return false
+	}
+	// Only allow http/https schemes.
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return false
 	}
 	host := parsed.Hostname()
 	if host == "" {
 		return false
 	}
+	// Normalize hosts for comparison (strip port).
+	normalizedHost := normalizeBaseDomain(requestHost)
+	if normalizedHost == "" {
+		normalizedHost = requestHost
+	}
 	// Allow same-host redirects.
-	if host == requestHost {
+	if host == normalizedHost {
 		return true
 	}
 	// Allow subdomains of the configured base domain (cookie scope).
@@ -356,9 +398,13 @@ func isValidRedirect(rd, baseDomain, requestHost string) bool {
 }
 
 // generateCSRFToken generates a cryptographically random CSRF token.
+// Returns empty string and logs an error if the system RNG fails.
 func generateCSRFToken() string {
 	b := make([]byte, 32)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		log.Printf("CSRF token generation failed: %v", err)
+		return ""
+	}
 	return base64.URLEncoding.EncodeToString(b)
 }
 

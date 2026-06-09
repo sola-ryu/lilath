@@ -77,18 +77,18 @@ func (s *TokenStore) Reload(path string) error {
 
 // Allow reports whether token is present in the store.
 // Uses constant-time comparison to prevent timing-based enumeration of valid tokens.
+// Iterates all tokens regardless of match to keep timing independent of validity.
 func (s *TokenStore) Allow(token string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	tokenHash := sha256.Sum256([]byte(token))
+	var result int
 	for t := range s.tokens {
 		storedHash := sha256.Sum256([]byte(t))
-		if subtle.ConstantTimeCompare(tokenHash[:], storedHash[:]) == 1 {
-			return true
-		}
+		result |= subtle.ConstantTimeCompare(tokenHash[:], storedHash[:])
 	}
-	return false
+	return result == 1
 }
 
 // IsEmpty reports whether the store contains no tokens.

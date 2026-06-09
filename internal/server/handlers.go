@@ -1,7 +1,10 @@
 package server
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"fmt"
 	"html/template"
 	"log"
@@ -170,8 +173,9 @@ func (h *Handlers) ForwardAuth(w http.ResponseWriter, r *http.Request) {
 }
 
 type loginData struct {
-	Error       string
+	Error      string
 	RedirectURL string
+	CSRFToken  string
 }
 
 // LoginPage renders the login form.
@@ -180,8 +184,29 @@ func (h *Handlers) LoginPage(w http.ResponseWriter, r *http.Request) {
 	if rd == "" {
 		rd = "/"
 	}
+
+	// Validate redirect URL: allow relative URLs and same-domain / subdomain URLs.
+	if !isValidRedirect(rd, h.cfg.BaseDomain, r.Host) {
+		rd = "/"
+	}
+
+	// Generate CSRF token and store it in a dedicated cookie.
+	csrfToken := generateCSRFToken()
+	http.SetCookie(w, &http.Cookie{
+		Name:     csrfCookieName(h.cfg.BaseDomain),
+		Value:    csrfToken,
+		Path:     "/",
+		Domain:   cookieDomain(h.cfg.BaseDomain),
+		HttpOnly: true,
+		Secure:   h.cfg.CookieSecure,
+		SameSite: http.SameSiteStrictMode,
+	})
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := h.loginTmpl.Execute(w, loginData{RedirectURL: rd}); err != nil {
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'self'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if err := h.loginTmpl.Execute(w, loginData{Error: "", RedirectURL: rd, CSRFToken: csrfToken}); err != nil {
 		log.Printf("template error: %v", err)
 	}
 }
@@ -208,6 +233,20 @@ func (h *Handlers) LoginSubmit(w http.ResponseWriter, r *http.Request) {
 	rd := r.FormValue("rd")
 	if rd == "" {
 		rd = "/"
+	}
+
+	// Validate CSRF token.
+	csrfCookie, err := r.Cookie(csrfCookieName(h.cfg.BaseDomain))
+	csrfForm := r.FormValue("csrf_token")
+	if err == nil && csrfCookie.Value != "" && csrfForm != "" {
+		if !constantTimeEqual([]byte(csrfCookie.Value), []byte(csrfForm)) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusForbidden)
+			if err := h.loginTmpl.Execute(w, loginData{Error: "Invalid or expired CSRF token.", RedirectURL: rd}); err != nil {
+				log.Printf("template error: %v", err)
+			}
+			return
+		}
 	}
 
 	if !h.creds.Verify(username, password) {
@@ -254,6 +293,82 @@ func (h *Handlers) Logout(w http.ResponseWriter, r *http.Request) {
 		Secure:   h.cfg.CookieSecure,
 	})
 	http.Redirect(w, r, "/login", http.StatusFound)
+}
+
+// LogoutWithCSRF validates the CSRF token before clearing the session.
+func (h *Handlers) LogoutWithCSRF(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err == nil {
+		csrfCookie, cookieErr := r.Cookie(csrfCookieName(h.cfg.BaseDomain))
+		csrfForm := r.FormValue("csrf_token")
+		if cookieErr == nil && csrfCookie.Value != "" && csrfForm != "" {
+			if !constantTimeEqual([]byte(csrfCookie.Value), []byte(csrfForm)) {
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+		}
+	}
+	h.Logout(w, r)
+}
+
+// isValidRedirect reports whether rd is a safe redirect target.
+// It allows:
+//   - Relative URLs (starting with / or ./)
+//   - Same-host URLs
+//   - Subdomain URLs of the configured BaseDomain (matching cookie scope)
+// It rejects protocol-relative URLs (//evil.com) and cross-origin absolute URLs.
+func isValidRedirect(rd, baseDomain, requestHost string) bool {
+	if rd == "" {
+		return false
+	}
+	// Reject protocol-relative URLs — they bypass the origin check entirely.
+	if strings.HasPrefix(rd, "//") {
+		return false
+	}
+	// Allow relative URLs (path-only or ../).
+	if !strings.Contains(rd, "://") {
+		return true
+	}
+	// Parse as absolute URL and validate the host.
+	parsed, err := url.Parse(rd)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return false
+	}
+	// Allow same-host redirects.
+	if host == requestHost {
+		return true
+	}
+	// Allow subdomains of the configured base domain (cookie scope).
+	if bd := normalizeBaseDomain(baseDomain); bd != "" {
+		// Exact match on base domain.
+		if host == bd {
+			return true
+		}
+		// Subdomain: host must end with .$bd (with dot to prevent prefix matches).
+		if strings.HasSuffix(host, "."+bd) {
+			return true
+		}
+	}
+	return false
+}
+
+// generateCSRFToken generates a cryptographically random CSRF token.
+func generateCSRFToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return base64.URLEncoding.EncodeToString(b)
+}
+
+// csrfCookieName returns the name used for the CSRF cookie.
+func csrfCookieName(baseDomain string) string {
+	domain := normalizeBaseDomain(baseDomain)
+	if domain == "" {
+		domain = "csrf"
+	}
+	return "csrf_" + strings.ReplaceAll(domain, ".", "_")
 }
 
 // isUserAllowed reports whether username is permitted to access the service
@@ -311,4 +426,9 @@ func normalizeBaseDomain(base string) string {
 
 func cookieDomain(base string) string {
 	return normalizeBaseDomain(base)
+}
+
+// constantTimeEqual compares two strings in constant time.
+func constantTimeEqual(a, b []byte) bool {
+	return subtle.ConstantTimeCompare(a, b) == 1
 }

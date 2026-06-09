@@ -2,6 +2,8 @@ package auth
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"os"
 	"strings"
@@ -74,11 +76,19 @@ func (s *TokenStore) Reload(path string) error {
 }
 
 // Allow reports whether token is present in the store.
+// Uses constant-time comparison to prevent timing-based enumeration of valid tokens.
 func (s *TokenStore) Allow(token string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	_, ok := s.tokens[token]
-	return ok
+
+	tokenHash := sha256.Sum256([]byte(token))
+	for t := range s.tokens {
+		storedHash := sha256.Sum256([]byte(t))
+		if subtle.ConstantTimeCompare(tokenHash[:], storedHash[:]) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 // IsEmpty reports whether the store contains no tokens.

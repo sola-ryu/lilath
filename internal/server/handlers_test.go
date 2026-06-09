@@ -3,6 +3,7 @@ package server_test
 import (
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"os"
@@ -1527,5 +1528,289 @@ func TestForwardAuth_BearerToken_BypassesUserAllowlist(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected %d: Bearer token should bypass user allowlist, got %d", http.StatusOK, resp.StatusCode)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Redirect validation — tested via LoginPage handler
+// --------------------------------------------------------------------------
+
+func TestLoginPage_RedirectValidation(t *testing.T) {
+	tests := []struct {
+		name          string
+		rd            string
+		baseDomain    string
+		wantRedirect  bool
+		wantCleanPath string
+	}{
+		{"relative url", "/protected", "", true, "/"},
+		{"protocol-relative rejected", "//evil.com/phish", "", true, "/"},
+		{"cross-origin rejected", "https://evil.com/phish", "example.com", true, "/"},
+		{"prefix attack rejected", "https://evil-example.com/phish", "example.com", true, "/"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/login?rd="+url.QueryEscape(tc.rd), nil)
+			if tc.baseDomain != "" {
+				req.Host = "example.com"
+			}
+
+			path := filepath.Join(t.TempDir(), "users.txt")
+			hash, err := auth.HashPassword(testPassword)
+			if err != nil {
+				t.Fatalf("HashPassword: %v", err)
+			}
+			if err := auth.WriteCredentials(path, map[string]string{testUser: hash}); err != nil {
+				t.Fatalf("WriteCredentials: %v", err)
+			}
+			creds, _ := auth.LoadCredentials(path)
+
+			cfg := &config.Config{
+				CookieName:        cookieName,
+				CookieSecure:      false,
+				SessionTTL:        60,
+				TrustForwardedFor: false,
+				BaseDomain:        tc.baseDomain,
+			}
+			sessions := auth.NewSessionStore(cfg.SessionTTL)
+			ipCheck, _ := auth.NewIPChecker(nil)
+			h, _ := server.NewHandlers(cfg, creds, sessions, ipCheck, auth.NewTokenStore())
+
+			rr := httptest.NewRecorder()
+			h.LoginPage(rr, req)
+			resp := rr.Result()
+			defer resp.Body.Close()
+
+			// Check the hidden rd field in the response body.
+			body, _ := io.ReadAll(resp.Body)
+			bodyStr := string(body)
+
+			if tc.wantRedirect {
+				if !strings.Contains(bodyStr, "csrf_") {
+					t.Errorf("expected CSRF token in response")
+				}
+			}
+		})
+	}
+}
+
+func TestLoginPage_RedirectValidation_ProtocolRelative(t *testing.T) {
+	rd := "//evil.com/phish"
+	req := httptest.NewRequest(http.MethodGet, "/login?rd="+url.QueryEscape(rd), nil)
+
+	path := filepath.Join(t.TempDir(), "users.txt")
+	hash, _ := auth.HashPassword(testPassword)
+	_ = auth.WriteCredentials(path, map[string]string{testUser: hash})
+	creds, _ := auth.LoadCredentials(path)
+
+	cfg := &config.Config{
+		CookieName: cookieName, CookieSecure: false, SessionTTL: 60,
+	}
+	sessions := auth.NewSessionStore(cfg.SessionTTL)
+	ipCheck, _ := auth.NewIPChecker(nil)
+	h, _ := server.NewHandlers(cfg, creds, sessions, ipCheck, auth.NewTokenStore())
+
+	rr := httptest.NewRecorder()
+	h.LoginPage(rr, req)
+	resp := rr.Result()
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	// The rd hidden field should NOT contain evil.com.
+	if strings.Contains(string(body), "evil.com") {
+		t.Error("protocol-relative URL was not rejected")
+	}
+}
+
+func TestLoginPage_RedirectValidation_CrossOrigin(t *testing.T) {
+	rd := "https://evil.com/phish"
+	req := httptest.NewRequest(http.MethodGet, "/login?rd="+url.QueryEscape(rd), nil)
+	req.Host = "example.com"
+
+	path := filepath.Join(t.TempDir(), "users.txt")
+	hash, _ := auth.HashPassword(testPassword)
+	_ = auth.WriteCredentials(path, map[string]string{testUser: hash})
+	creds, _ := auth.LoadCredentials(path)
+
+	cfg := &config.Config{
+		CookieName: cookieName, CookieSecure: false, SessionTTL: 60,
+		BaseDomain: "example.com",
+	}
+	sessions := auth.NewSessionStore(cfg.SessionTTL)
+	ipCheck, _ := auth.NewIPChecker(nil)
+	h, _ := server.NewHandlers(cfg, creds, sessions, ipCheck, auth.NewTokenStore())
+
+	rr := httptest.NewRecorder()
+	h.LoginPage(rr, req)
+	resp := rr.Result()
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "evil.com") {
+		t.Error("cross-origin URL was not rejected")
+	}
+}
+
+// --------------------------------------------------------------------------
+// CSRF protection on POST /login
+// --------------------------------------------------------------------------
+
+func TestLoginSubmit_CSRFValidation(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	// Cookie jar so CSRF cookie persists between GET and POST.
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// GET /login — server sets the CSRF cookie.
+	resp, err := client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+
+	var csrfToken string
+	for _, c := range resp.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			csrfToken = c.Value
+			break
+		}
+	}
+	resp.Body.Close()
+	if csrfToken == "" {
+		t.Fatal("no CSRF token found on login page")
+	}
+
+	// Submit with correct CSRF token — should succeed.
+	form := url.Values{
+		"username":   {testUser},
+		"password":   {testPassword},
+		"rd":         {"/"},
+		"csrf_token": {csrfToken},
+	}
+	resp, err = client.PostForm(ts.URL+"/login", form)
+	if err != nil {
+		t.Fatalf("POST /login with valid CSRF: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected %d with valid CSRF, got %d", http.StatusFound, resp.StatusCode)
+	}
+
+	// Submit with wrong CSRF token — should fail.
+	form.Set("csrf_token", "wrong-token")
+	resp, err = client.PostForm(ts.URL+"/login", form)
+	if err != nil {
+		t.Fatalf("POST /login with invalid CSRF: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected %d with invalid CSRF, got %d", http.StatusForbidden, resp.StatusCode)
+	}
+}
+
+// --------------------------------------------------------------------------
+// CSP and security headers on GET /login
+// --------------------------------------------------------------------------
+
+func TestLoginPage_SecurityHeaders(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	resp, err := http.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected %d, got %d", http.StatusOK, resp.StatusCode)
+	}
+
+	checkHeader := func(name, expected string) {
+		got := resp.Header.Get(name)
+		if got != expected {
+			t.Errorf("header %s = %q; want %q", name, got, expected)
+		}
+	}
+
+	checkHeader("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'self'")
+	checkHeader("X-Frame-Options", "DENY")
+	checkHeader("X-Content-Type-Options", "nosniff")
+}
+
+// --------------------------------------------------------------------------
+// CSRF on POST /logout
+// --------------------------------------------------------------------------
+
+func TestLogoutWithCSRF(t *testing.T) {
+	ts, _ := newTestServer(t)
+
+	// Single client with cookie jar so both session and CSRF cookies persist.
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Login to get session cookie.
+	form := url.Values{
+		"username": {testUser},
+		"password": {testPassword},
+		"rd":       {"/"},
+	}
+	resp, err := client.PostForm(ts.URL+"/login", form)
+	if err != nil {
+		t.Fatalf("POST /login: %v", err)
+	}
+	resp.Body.Close()
+
+	// Get login page for CSRF token (the session cookie should still be there).
+	resp, err = client.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var csrfToken string
+	for _, c := range resp.Cookies() {
+		if strings.HasPrefix(c.Name, "csrf_") {
+			csrfToken = c.Value
+			break
+		}
+	}
+	if csrfToken == "" {
+		t.Fatal("no CSRF token on login page")
+	}
+
+	// POST /logout with valid CSRF.
+	form2 := url.Values{"csrf_token": {csrfToken}}
+	resp, err = client.PostForm(ts.URL+"/logout", form2)
+	if err != nil {
+		t.Fatalf("POST /logout with valid CSRF: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected %d with valid CSRF, got %d", http.StatusFound, resp.StatusCode)
+	}
+
+	// POST /logout with invalid CSRF.
+	form2.Set("csrf_token", "wrong")
+	resp, err = client.PostForm(ts.URL+"/logout", form2)
+	if err != nil {
+		t.Fatalf("POST /logout with invalid CSRF: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected %d with invalid CSRF, got %d", http.StatusBadRequest, resp.StatusCode)
 	}
 }

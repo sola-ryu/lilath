@@ -37,8 +37,10 @@ func NewServer(addr string, h *Handlers) *http.Server {
 	mux.HandleFunc("GET /auth", h.ForwardAuth)
 	mux.HandleFunc("GET /login", h.LoginPage)
 	mux.HandleFunc("POST /login", h.LoginSubmit)
-	mux.HandleFunc("GET /logout", h.Logout)
-	mux.HandleFunc("POST /logout", h.Logout)
+	mux.HandleFunc("GET /logout", func(w http.ResponseWriter, r *http.Request) {
+		h.Logout(w, r)
+	})
+	mux.HandleFunc("POST /logout", h.LogoutWithCSRF)
 
 	return &http.Server{
 		Addr:         addr,

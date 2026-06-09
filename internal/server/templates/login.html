@@ -149,6 +149,7 @@
     {{end}}
 
     <form method="POST" action="/login" autocomplete="on">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <input type="hidden" name="rd" value="{{.RedirectURL}}">
 
       <label for="username">Username</label>

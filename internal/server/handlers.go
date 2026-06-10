@@ -245,12 +245,26 @@ func (h *Handlers) LoginSubmit(w http.ResponseWriter, r *http.Request) {
 	csrfCookie, csrfErr := r.Cookie(csrfCookieName(h.cfg.BaseDomain))
 	csrfForm := r.FormValue("csrf_token")
 	if csrfErr != nil || csrfCookie.Value == "" || csrfForm == "" {
+		csrfToken := generateCSRFToken()
+		if csrfToken == "" {
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     csrfCookieName(h.cfg.BaseDomain),
+			Value:    csrfToken,
+			Path:     "/",
+			Domain:   cookieDomain(h.cfg.BaseDomain),
+			HttpOnly: true,
+			Secure:   h.cfg.CookieSecure,
+			SameSite: http.SameSiteStrictMode,
+		})
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'self'")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusForbidden)
-		if err := h.loginTmpl.Execute(w, loginData{Error: "CSRF token missing or invalid.", RedirectURL: rd}); err != nil {
+		if err := h.loginTmpl.Execute(w, loginData{Error: "CSRF token missing or invalid.", RedirectURL: rd, CSRFToken: csrfToken}); err != nil {
 			log.Printf("template error: %v", err)
 		}
 		return
@@ -261,7 +275,7 @@ func (h *Handlers) LoginSubmit(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.WriteHeader(http.StatusForbidden)
-		if err := h.loginTmpl.Execute(w, loginData{Error: "Invalid or expired CSRF token.", RedirectURL: rd}); err != nil {
+		if err := h.loginTmpl.Execute(w, loginData{Error: "Invalid or expired CSRF token.", RedirectURL: rd, CSRFToken: csrfCookie.Value}); err != nil {
 			log.Printf("template error: %v", err)
 		}
 		return
@@ -370,21 +384,29 @@ func isValidRedirect(rd, baseDomain, requestHost string) bool {
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return false
 	}
-	host := parsed.Hostname()
+	host := strings.ToLower(parsed.Hostname())
 	if host == "" {
 		return false
 	}
-	// Normalize hosts for comparison (strip port).
-	normalizedHost := normalizeBaseDomain(requestHost)
+	// Normalize requestHost for comparison (strip port and brackets, then lower-case).
+	normalizedHost := strings.TrimSpace(requestHost)
+	if strings.HasPrefix(normalizedHost, "[") {
+		if end := strings.Index(normalizedHost, "]"); end != -1 {
+			normalizedHost = normalizedHost[1:end]
+		}
+	} else if i := strings.LastIndex(normalizedHost, ":"); i != -1 {
+		normalizedHost = normalizedHost[:i]
+	}
+	normalizedHost = strings.ToLower(normalizeBaseDomain(normalizedHost))
 	if normalizedHost == "" {
-		normalizedHost = requestHost
+		normalizedHost = strings.ToLower(requestHost)
 	}
 	// Allow same-host redirects.
 	if host == normalizedHost {
 		return true
 	}
 	// Allow subdomains of the configured base domain (cookie scope).
-	if bd := normalizeBaseDomain(baseDomain); bd != "" {
+	if bd := strings.ToLower(normalizeBaseDomain(baseDomain)); bd != "" {
 		// Exact match on base domain.
 		if host == bd {
 			return true
@@ -412,7 +434,7 @@ func generateCSRFToken() string {
 func csrfCookieName(baseDomain string) string {
 	domain := normalizeBaseDomain(baseDomain)
 	if domain == "" {
-		domain = "csrf"
+		return "csrf_token"
 	}
 	return "csrf_" + strings.ReplaceAll(domain, ".", "_")
 }
